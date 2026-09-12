@@ -1,36 +1,202 @@
-# This is a basic workflow to help you get started with Actions
+name: Build APK
 
-name: CI
+# Builds an installable Android APK on GitHub's servers, so nobody needs
+# Flutter, Android Studio or any other software on their own computer.
+#
+# It accepts the project in either shape:
+#   A. the source files at the root of the repository (a normal checkout), or
+#   B. a single .zip of the project at the root of the repository.
+#
+# B exists because GitHub's web uploader takes at most 100 files at a time and
+# this project has more than that. Uploading one zip is one drag; uploading the
+# tree through the browser is not possible in one go.
+#
+# How to get the finished file:
+#   * Actions tab -> open the finished run -> download the "expiry-guardian-apk"
+#     artifact (arrives as a .zip that has to be unpacked), or
+#   * publish a release with a new tag starting with "v" and the APKs are
+#     attached to it as direct downloads - much easier on a phone.
 
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: [ "main" ]
+    branches: [main, master]
+    tags: ['v*']
   pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
+    branches: [main, master]
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
-jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+# Uploading files to a release, and letting GitHub auto-write the release
+# notes, are both write operations. Without this, the repository's default
+# token is read-only and the "Attach the APKs to the release" step fails
+# with "Resource not accessible by integration" - which is exactly the
+# error that broke the v1.0.1 and v1.0.2 releases.
+permissions:
+  contents: write
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
+env:
+  FLUTTER_VERSION: '3.47.2'
+  NDK_VERSION: '28.2.13676358'
+
+jobs:
+  verify:
+    name: Analyse and test
+    runs-on: ubuntu-latest
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v4
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Unpack the project if it was uploaded as a zip
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          set -e
+          if [ -f pubspec.yaml ]; then
+            echo "Source files are already at the root."
+            exit 0
+          fi
+          zipfile=$(ls -1 *.zip 2>/dev/null | head -n 1 || true)
+          if [ -z "$zipfile" ]; then
+            echo "::error::No pubspec.yaml and no .zip at the root of the repository."
+            exit 1
+          fi
+          echo "Unpacking $zipfile"
+          mkdir -p .unpacked
+          unzip -q "$zipfile" -d .unpacked
+          manifest=$(find .unpacked -maxdepth 3 -name pubspec.yaml -print -quit)
+          if [ -z "$manifest" ]; then
+            echo "::error::$zipfile does not contain a pubspec.yaml."
+            exit 1
+          fi
+          root=$(dirname "$manifest")
+          echo "Project root inside the zip: $root"
+          # cp -a merges into directories that already exist here (.github does,
+          # because the workflow you are reading lives in it); mv would refuse.
+          cp -a "$root/." .
+          rm -rf .unpacked
+          ls -a
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Static analysis
+        run: flutter analyze
+
+      - name: Unit and widget tests
+        run: flutter test --reporter expanded
+
+  build:
+    name: Build release APK
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the project if it was uploaded as a zip
+        run: |
+          set -e
+          if [ -f pubspec.yaml ]; then
+            echo "Source files are already at the root."
+            exit 0
+          fi
+          zipfile=$(ls -1 *.zip 2>/dev/null | head -n 1 || true)
+          if [ -z "$zipfile" ]; then
+            echo "::error::No pubspec.yaml and no .zip at the root of the repository."
+            exit 1
+          fi
+          mkdir -p .unpacked
+          unzip -q "$zipfile" -d .unpacked
+          root=$(dirname "$(find .unpacked -maxdepth 3 -name pubspec.yaml -print -quit)")
+          cp -a "$root/." .
+          rm -rf .unpacked
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      # `sdkmanager` is not on PATH on GitHub's ubuntu runners, so it has to be
+      # located inside the SDK. If it cannot be found the step still succeeds:
+      # the Android Gradle Plugin downloads the pinned NDK by itself, it is only
+      # slower. Never fail the build here - the NDK is a means, not the goal.
+      - name: Install the Android NDK
+        run: |
+          set -u
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Android/sdk}}"
+          echo "Android SDK: $SDK"
+          SDKMANAGER=$(find "$SDK" -maxdepth 4 -type f -name sdkmanager 2>/dev/null | head -n 1 || true)
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager was not found; Gradle will download ndk;${NDK_VERSION} during the build."
+            exit 0
+          fi
+          echo "Using $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install "ndk;${NDK_VERSION}" || \
+            echo "sdkmanager could not install the NDK; Gradle will download it during the build."
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # `flutter create` only fills in files that are missing, so a checkout
+      # that already contains android/ is left alone. The patch script is
+      # idempotent and re-applies this app's own configuration either way.
+      - name: Prepare the Android project
+        run: |
+          flutter create --platforms=android --org com.expiryguardian --project-name expiry_guardian .
+          python3 tool/patch_android.py
+          python3 -m pip install --quiet pillow || true
+          python3 tool/generate_icons.py
+
+      - name: Build APK (one file for every phone)
+        run: flutter build apk --release
+
+      - name: Build per-architecture APKs (smaller downloads)
+        run: flutter build apk --release --split-per-abi
+
+      - name: Report the sizes
+        run: ls -lh build/app/outputs/flutter-apk/*.apk
+
+      - name: Upload the APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: expiry-guardian-apk
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            build/app/outputs/flutter-apk/app-release.apk
+            build/app/outputs/flutter-apk/app-*-release.apk
+
+      # Give the release copies names a person can recognise on a phone,
+      # where the download list shows the file name and nothing else.
+      # "app-arm64-v8a-release.apk" tells a shop assistant nothing.
+      - name: Name the release copies
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -e
+          out=build/app/outputs/flutter-apk
+          ver="${GITHUB_REF_NAME#v}"
+          mkdir -p release
+          cp "$out/app-arm64-v8a-release.apk" "release/ExpiryGuardian-$ver.apk"
+          cp "$out/app-release.apk" "release/ExpiryGuardian-$ver-moi-may.apk"
+          ls -lh release
+
+      # Publishing a release (Releases -> Create a new release -> new tag v1.0.1)
+      # attaches the APKs to it: a direct download on a phone, with no artifact
+      # zip to unpack. Two files are attached because the ordinary one is a
+      # third of the size, and it fits every phone sold since about 2015.
+      - name: Attach the APKs to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            release/ExpiryGuardian-*.apk
+          generate_release_notes: true
