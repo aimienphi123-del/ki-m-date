@@ -174,15 +174,42 @@ jobs:
             build/app/outputs/flutter-apk/app-release.apk
             build/app/outputs/flutter-apk/app-*-release.apk
 
+      # Where the release gets its name.
+      #
+      # A pushed tag names itself. A manual run takes the version out of
+      # pubspec.yaml instead, which exists because pushing a tag is not always
+      # possible - a token scoped to one branch is refused on refs/tags with a
+      # bare 403 - and a download a shop can tap on a phone should not depend
+      # on that. The action below creates the tag when it is missing, so the
+      # two routes end in the same place.
+      - name: Decide the release name
+        id: release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        run: |
+          set -e
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            ver=$(sed -n 's/^version: *\([0-9][0-9.]*\).*/\1/p' pubspec.yaml | head -n 1)
+            if [ -z "$ver" ]; then
+              echo "::error::Could not read the version out of pubspec.yaml"
+              exit 1
+            fi
+            tag="v$ver"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "Publishing release $tag"
+
       # Give the release copies names a person can recognise on a phone,
       # where the download list shows the file name and nothing else.
       # "app-arm64-v8a-release.apk" tells a shop assistant nothing.
       - name: Name the release copies
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: steps.release.outputs.tag != ''
         run: |
           set -e
           out=build/app/outputs/flutter-apk
-          ver="${GITHUB_REF_NAME#v}"
+          ver="${{ steps.release.outputs.version }}"
           mkdir -p release
           cp "$out/app-arm64-v8a-release.apk" "release/ExpiryGuardian-$ver.apk"
           cp "$out/app-release.apk" "release/ExpiryGuardian-$ver-moi-may.apk"
@@ -193,9 +220,11 @@ jobs:
       # zip to unpack. Two files are attached because the ordinary one is a
       # third of the size, and it fits every phone sold since about 2015.
       - name: Attach the APKs to the release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: steps.release.outputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           fail_on_unmatched_files: true
           files: |
             release/ExpiryGuardian-*.apk
