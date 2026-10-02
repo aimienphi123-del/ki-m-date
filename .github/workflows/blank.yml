@@ -211,8 +211,8 @@ jobs:
           out=build/app/outputs/flutter-apk
           ver="${{ steps.release.outputs.version }}"
           mkdir -p release
-          cp "$out/app-arm64-v8a-release.apk" "release/ExpiryGuardian-$ver.apk"
-          cp "$out/app-release.apk" "release/ExpiryGuardian-$ver-moi-may.apk"
+          cp "$out/app-arm64-v8a-release.apk" "release/KiemDate-$ver.apk"
+          cp "$out/app-release.apk" "release/KiemDate-$ver-moi-may.apk"
           ls -lh release
 
       # Publishing a release (Releases -> Create a new release -> new tag v1.0.1)
@@ -227,5 +227,5 @@ jobs:
           target_commitish: ${{ github.sha }}
           fail_on_unmatched_files: true
           files: |
-            release/ExpiryGuardian-*.apk
+            release/KiemDate-*.apk
           generate_release_notes: true
